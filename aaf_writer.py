@@ -14,7 +14,7 @@ import aaf2.components
 import aaf2.ama
 from aaf2.rational import AAFRational
 
-from ptx_parser import SessionData, AudioFile, TrackPlacement
+from ptx_parser import SessionData, AudioFile, Region, TrackPlacement
 
 
 def _make_wave_summary(channels: int, sample_rate: int, bit_depth: int) -> bytes:
@@ -42,15 +42,135 @@ def _make_wave_summary(channels: int, sample_rate: int, bit_depth: int) -> bytes
 def _get_audio_channels_and_depth(path: str) -> tuple[int, int]:
     try:
         with open(path, 'rb') as f:
-            f.seek(20)
-            data = f.read(14)
-        if len(data) < 14:
-            return 1, 24
-        channels = struct.unpack_from('<H', data, 2)[0]
-        bit_depth = struct.unpack_from('<H', data, 12)[0]
-        return max(1, channels), max(8, bit_depth)
+            header = f.read(12)
+            if len(header) < 12 or header[:4] != b'RIFF' or header[8:12] != b'WAVE':
+                return 1, 24
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                chunk_id = hdr[:4]
+                chunk_size = struct.unpack_from('<I', hdr, 4)[0]
+                padded = chunk_size + (chunk_size % 2)
+                if chunk_id == b'fmt ':
+                    chunk = f.read(padded)
+                    if len(chunk) >= 16:
+                        channels = struct.unpack_from('<H', chunk, 2)[0]
+                        bit_depth = struct.unpack_from('<H', chunk, 14)[0]
+                        return max(1, channels), max(8, bit_depth)
+                    break
+                else:
+                    f.seek(padded, 1)
     except OSError:
-        return 1, 24
+        pass
+    return 1, 24
+
+
+def _trim_for_fades(placements: list, track_name: str, warnings: list) -> list:
+    """
+    Pre-rendered fade files overlap the ends/starts of adjacent main clips.
+    Trim those main clips so the timeline has no overlapping audio.
+
+    Fade-out:  main clip [====|fade|]  →  [====] + [fade]
+    Fade-in:   main clip [|fade|====]  →  [fade] + [====]
+    Crossfade: clip_A [===|xfade]  clip_B [xfade|===]  →  [===] [xfade] [===]
+    """
+    fades = [p for p in placements if p.region.audio_file.is_fade]
+    if not fades:
+        return placements
+
+    mains = [p for p in placements if not p.region.audio_file.is_fade]
+    result = []
+
+    for p in mains:
+        r = p.region
+        clip_start = r.start_pos
+        clip_end = r.start_pos + r.length
+        trim_start = clip_start
+        trim_end = clip_end
+
+        for fp in fades:
+            fr = fp.region
+            fade_start = fr.start_pos
+            fade_end = fr.start_pos + fr.length
+
+            # Fade overlaps the end of this clip (fade-out or crossfade tail)
+            if clip_start < fade_start < trim_end:
+                trim_end = min(trim_end, fade_start)
+
+            # Fade overlaps the start of this clip (fade-in or crossfade head)
+            if trim_start < fade_end <= clip_end and fade_start <= clip_start:
+                trim_start = max(trim_start, fade_end)
+
+        if trim_end <= trim_start:
+            warnings.append(f"Track '{track_name}': clip '{r.name}' fully consumed by fade(s), dropping")
+            continue
+
+        if trim_start != r.start_pos or trim_end != r.start_pos + r.length:
+            offset_adjust = trim_start - r.start_pos
+            trimmed_region = Region(
+                index=r.index,
+                name=r.name,
+                audio_file=r.audio_file,
+                start_pos=trim_start,
+                sample_offset=r.sample_offset + offset_adjust,
+                length=trim_end - trim_start,
+            )
+            result.append(TrackPlacement(p.track_name, p.track_index, trimmed_region))
+        else:
+            result.append(p)
+
+    result.extend(fades)
+    result.sort(key=lambda p: p.region.start_pos)
+    return result
+
+
+def _resolve_comp_overlaps(placements: list, track_name: str, warnings: list) -> list:
+    """
+    Build a non-overlapping timeline from possibly-overlapping comp clips.
+    Shorter clips take priority (they represent specific edits); longer clips
+    fill only unclaimed portions of their time range.
+    """
+    by_priority = sorted(placements, key=lambda p: (p.region.length, p.region.start_pos))
+    claimed: list[tuple[int, int]] = []
+    result: list = []
+
+    for p in by_priority:
+        r = p.region
+        seg_start = r.start_pos
+        seg_end = r.start_pos + r.length
+
+        overlap_claimed = [(s, e) for s, e in claimed if s < seg_end and e > seg_start]
+
+        if not overlap_claimed:
+            result.append(p)
+            claimed.append((seg_start, seg_end))
+            continue
+
+        # Find unclaimed sub-intervals within [seg_start, seg_end]
+        events = sorted(set(
+            [seg_start, seg_end] +
+            [max(seg_start, s) for s, e in overlap_claimed] +
+            [min(seg_end, e) for s, e in overlap_claimed]
+        ))
+
+        added_any = False
+        for i in range(len(events) - 1):
+            gap_start, gap_end = events[i], events[i + 1]
+            if gap_end <= seg_start or gap_start >= seg_end:
+                continue
+            if any(s <= gap_start and e >= gap_end for s, e in overlap_claimed):
+                continue  # fully claimed
+            gap_offset = r.sample_offset + (gap_start - r.start_pos)
+            gap_region = Region(r.index, r.name, r.audio_file, gap_start, gap_offset, gap_end - gap_start)
+            result.append(TrackPlacement(p.track_name, p.track_index, gap_region))
+            claimed.append((gap_start, gap_end))
+            added_any = True
+
+        if not added_any:
+            warnings.append(f"Track '{track_name}': clip '{r.name}' fully covered by higher-priority clips, dropping")
+
+    return sorted(result, key=lambda p: p.region.start_pos)
 
 
 def _network_locator(f, path: str):
@@ -89,6 +209,8 @@ def write(session: SessionData, output_path: str, warnings: list | None = None) 
 
         for track_index in sorted(tracks.keys()):
             track_name, placements = tracks[track_index]
+            placements = _resolve_comp_overlaps(placements, track_name, warnings)
+            placements = _trim_for_fades(placements, track_name, warnings)
             placements.sort(key=lambda p: p.region.start_pos)
 
             slot = comp.create_sound_slot(edit_rate=edit_rate)
@@ -111,9 +233,16 @@ def write(session: SessionData, output_path: str, warnings: list | None = None) 
                     )
                     continue
 
+                clip_length = r.length if r.length > 0 else r.audio_file.length
+                if clip_length <= 0:
+                    warnings.append(
+                        f"Track '{track_name}': clip '{r.name}' has unknown length, skipping"
+                    )
+                    continue
+
                 master_mob = master_mobs.get(r.audio_file.index)
                 if master_mob is None:
-                    filler = f.create.Filler(media_kind='sound', length=r.length)
+                    filler = f.create.Filler(media_kind='sound', length=clip_length)
                     seq.components.append(filler)
                     warnings.append(
                         f"Track '{track_name}': missing mob for '{r.audio_file.filename}', inserting filler"
@@ -122,11 +251,11 @@ def write(session: SessionData, output_path: str, warnings: list | None = None) 
                     clip = master_mob.create_source_clip(
                         slot_id=1,
                         start=r.sample_offset,
-                        length=r.length,
+                        length=clip_length,
                     )
                     seq.components.append(clip)
 
-                cursor = r.start_pos + r.length
+                cursor = r.start_pos + clip_length
 
             # Set sequence and slot length to total duration
             seq.length = cursor

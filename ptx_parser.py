@@ -25,6 +25,7 @@ class AudioFile:
     filename: str
     length: int = 0
     resolved_path: str | None = None
+    is_fade: bool = False
 
 
 @dataclass
@@ -62,7 +63,37 @@ class Block:
     children: list = field(default_factory=list)
 
 
-VALID_AUDIO_TYPES = {b'WAVE', b'EVAW', b'AIFF', b'FFIA'}
+AUDIO_EXTENSIONS = ('.wav', '.aif', '.aiff', '.bwf', '.w64')
+
+
+def _get_wav_nsamples(path: str) -> int:
+    """Return sample count for a WAV/BWF file by scanning RIFF chunks."""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(12)
+            if len(header) < 12 or header[:4] != b'RIFF' or header[8:12] != b'WAVE':
+                return 0
+            channels, bpf = 1, 2
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                chunk_id = hdr[:4]
+                chunk_size = struct.unpack_from('<I', hdr, 4)[0]
+                padded = chunk_size + (chunk_size % 2)
+                if chunk_id == b'fmt ':
+                    chunk = f.read(padded)
+                    if len(chunk) >= 16:
+                        channels = struct.unpack_from('<H', chunk, 2)[0]
+                        bit_depth = struct.unpack_from('<H', chunk, 14)[0]
+                        bpf = max(1, channels * (bit_depth // 8))
+                elif chunk_id == b'data':
+                    return chunk_size // bpf
+                else:
+                    f.seek(padded, 1)
+    except OSError:
+        pass
+    return 0
 
 
 def _gen_xor_delta(xor_value, mul, negative):
@@ -139,8 +170,10 @@ def _parse_string(data, offset, big_endian):
 
 
 def _parse_block_at(data, pos, max_end, big_endian):
-    if pos >= max_end or pos + 9 > len(data):
-        return None, pos
+    if pos >= max_end:
+        return None, pos           # signal caller we're done — no advancement
+    if pos + 9 > len(data):
+        return None, pos + 1       # not enough room for a header, skip this byte
     if data[pos] != 0x5A:
         return None, pos + 1
 
@@ -148,26 +181,37 @@ def _parse_block_at(data, pos, max_end, big_endian):
     block_size = _read4(data, pos + 3, big_endian)
     content_type = _read2(data, pos + 7, big_endian)
 
-    # content starts at pos+9 (after the 9-byte header)
-    content_offset = pos + 9
-    # total block span: 7 bytes (header before size) + block_size bytes
-    # block_size includes the 2-byte content_type field
+    # total block span: 7-byte header + block_size (which includes the 2-byte content_type)
     block_end = pos + 7 + block_size
+
+    # Reject blocks whose declared size extends beyond the file — these are
+    # false-positive 0x5A bytes with random bytes forming an unrealistic size.
     if block_end > len(data):
-        block_end = len(data)
+        return None, pos + 1
+
+    content_offset = pos + 9
+    scope_end = min(block_end, max_end)
 
     block = Block(
         block_type=block_type,
         block_size=block_size,
         content_type=content_type,
-        offset=content_offset,
+        offset=pos + 7,  # matches ptformat: points to content_type field, not past it
     )
 
+    # Scan for child blocks within this block's content area.
+    # Use bytes.find() to jump directly to the next 0x5A instead of advancing
+    # byte-by-byte, which turns an O(n²) scan into O(n).
     child_pos = content_offset
-    while child_pos < block_end and child_pos < max_end:
-        child, child_pos = _parse_block_at(data, child_pos, block_end, big_endian)
+    while child_pos < scope_end:
+        next_z = data.find(0x5A, child_pos, scope_end)
+        if next_z == -1:
+            break
+        child, child_pos = _parse_block_at(data, next_z, scope_end, big_endian)
         if child is not None:
             block.children.append(child)
+        else:
+            child_pos = next_z + 1   # false positive, skip past it
 
     return block, block_end
 
@@ -217,13 +261,13 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
     with open(ptf_path, 'rb') as f:
         raw = f.read()
 
-    if len(raw) < 4 or raw[3] != 0x03:
-        raise ParseError("Not a Pro Tools session file (missing magic byte at 0x03)")
+    if len(raw) < 4 or raw[0] != 0x03:
+        raise ParseError("Not a Pro Tools session file (missing magic byte 0x03 at offset 0)")
 
     data = _decrypt(raw)
 
-    # Detect endianness
-    big_endian = bool(data[0x11] & 0x01) if len(data) > 0x11 else False
+    # Detect endianness: ptformat convention — byte 0x11 == 0x01 means big-endian
+    big_endian = (data[0x11] == 0x01) if len(data) > 0x11 else False
 
     # Detect version
     version = None
@@ -242,9 +286,14 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
     blocks = []
     pos = 0x14
     while pos < len(data):
-        block, pos = _parse_block_at(data, pos, len(data), big_endian)
+        next_z = data.find(0x5A, pos)
+        if next_z == -1:
+            break
+        block, pos = _parse_block_at(data, next_z, len(data), big_endian)
         if block is not None:
             blocks.append(block)
+        else:
+            pos = next_z + 1
 
     idx = _index_blocks(blocks)
 
@@ -263,15 +312,6 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
     audio_files = []
     audio_lengths = {}
 
-    if 0x1001 in idx:
-        for b in idx[0x1001]:
-            p = b.offset + 8
-            i = 0
-            while p + 8 <= b.offset + b.block_size:
-                audio_lengths[i] = _read8(data, p, big_endian) if p + 8 <= len(data) else 0
-                p += 8
-                i += 1
-
     if 0x103a in idx:
         for b in idx[0x103a]:
             p = b.offset + 11
@@ -288,7 +328,7 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
                 wavtype = data[p:p + 4] if p + 4 <= len(data) else b''
                 p += 4
                 p += 5  # skip metadata bytes
-                if wavtype in VALID_AUDIO_TYPES:
+                if filename.lower().endswith(AUDIO_EXTENSIONS):
                     af = AudioFile(
                         index=len(audio_files),
                         filename=filename,
@@ -300,12 +340,17 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
     if not audio_files:
         warnings.append("No audio files found in session")
 
-    # Resolve paths
+    # Resolve paths and detect fade files
     session_dir = os.path.dirname(os.path.abspath(ptf_path))
     for af in audio_files:
         af.resolved_path = _resolve_audio_path(session_dir, af.filename)
+        # PTF stores relative paths; "Fade Files" in the name or resolved path = pre-rendered fade
+        path_hint = (af.resolved_path or '') + af.filename
+        af.is_fade = 'fade files' in path_hint.lower()
         if af.resolved_path is None:
             warnings.append(f"Audio file not found on disk: {af.filename}")
+        elif af.length == 0:
+            af.length = _get_wav_nsamples(af.resolved_path)
 
     session.audio_files = audio_files
 
@@ -317,7 +362,7 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
         container_type, child_type = 0x262a, 0x2629
 
     if child_type in idx:
-        for i, b in enumerate(idx[child_type]):
+        for i, b in enumerate(sorted(idx[child_type], key=lambda b: b.offset)):
             p = b.offset + 11
             if p + 4 > len(data):
                 continue
@@ -326,12 +371,13 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
                 continue
             p += 4
             name = data[p:p + name_len].decode('latin-1', errors='replace')
-            p += name_len + 4  # skip 4 bytes after name
+            p += name_len
 
-            sample_offset, length, start_pos = _parse_three_point(data, p, big_endian, ratefactor)
+            # Region time values are in raw samples; ratefactor does not apply here.
+            sample_offset, length, start_pos = _parse_three_point(data, p, big_endian, 1.0)
 
-            # audio file index at end of block
-            findex_pos = b.offset + b.block_size
+            # audio file index: 4 bytes at block_size-13 from b.offset
+            findex_pos = b.offset + b.block_size - 13
             if findex_pos + 4 <= len(data):
                 findex = _read4(data, findex_pos, big_endian)
             else:
@@ -357,65 +403,103 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
     # --- Track placements ---
     placements = []
 
-    # Build track name lookup from 0x1015 → 0x1014
-    track_names = {}
+    # Build ordered track name list from 0x1014 blocks (sorted by file offset = session order)
+    track_names_ordered = []
     if 0x1014 in idx:
-        for b in idx[0x1014]:
+        for b in sorted(idx[0x1014], key=lambda b: b.offset):
             p = b.offset + 2
             if p + 4 > len(data):
                 continue
             name, name_len = _parse_string(data, p, big_endian)
-            p += 4 + name_len + 5
-            if p + 4 > len(data):
-                continue
-            nch = _read4(data, p, big_endian)
-            p += 4
-            p += nch * 2
-            # track index is block_type of the parent 0x1014 block
-            track_idx = b.block_type
-            track_names[track_idx] = name
+            if name_len > 0:
+                track_names_ordered.append(name)
 
     # Build region index
     region_by_index = {r.index: r for r in regions}
 
-    # Walk 0x100e blocks for placements
-    if 0x100e in idx:
-        for b in idx[0x100e]:
-            if b.offset + 8 > len(data):
+    # Walk 0x1054 → 0x1052 (tracks) → 0x1050 → 0x104f (placements)
+    # PT7/8 uses this hierarchy; each 0x1052 is one track in order.
+    # Region index is stored at b4f.offset+2 as a 4-byte LE value where
+    # the actual index occupies the high 2 bytes: region_idx = value >> 16.
+    found_placements = False
+    if 0x1054 in idx:
+        for b54 in sorted(idx[0x1054], key=lambda b: b.offset):
+            children_52 = [c for c in b54.children if c.content_type == 0x1052]
+            if not children_52:
                 continue
-            raw_track_idx = _read4(data, b.offset + 4, big_endian)
-            track_name = track_names.get(raw_track_idx, f"Track {raw_track_idx}")
+            for ti, b52 in enumerate(children_52):
+                track_name = track_names_ordered[ti] if ti < len(track_names_ordered) else f"Track {ti}"
+                for b50 in b52.children:
+                    if b50.content_type != 0x1050:
+                        continue
+                    for b4f in b50.children:
+                        if b4f.content_type != 0x104f:
+                            continue
+                        if b4f.offset + 6 > len(data):
+                            continue
+                        region_idx = _read4(data, b4f.offset + 2, big_endian) >> 16
+                        region = region_by_index.get(region_idx)
+                        if region is None:
+                            warnings.append(
+                                f"Track '{track_name}': no region at index {region_idx}, skipping"
+                            )
+                            continue
+                        # Timeline position lives at b4f.offset+9 (verified for PT7/8).
+                        tl_start = _read4(data, b4f.offset + 9, big_endian) if b4f.offset + 13 <= len(data) else 0
+                        # Skip "displaced" clips: clips whose region was originally defined at a
+                        # different timeline position than where they are placed here. These are
+                        # alternate takes or cross-track edits that were superseded in the final
+                        # session state. Clips at their native position (start_pos == tl_start)
+                        # represent the active comp.
+                        if region.start_pos != tl_start:
+                            warnings.append(
+                                f"Track '{track_name}': skipping displaced clip '{region.name}' "
+                                f"(native pos={region.start_pos}, placed at={tl_start})"
+                            )
+                            continue
+                        placed = Region(
+                            index=region.index,
+                            name=region.name,
+                            audio_file=region.audio_file,
+                            start_pos=tl_start,
+                            sample_offset=region.sample_offset,
+                            length=region.length if region.length > 0 else region.audio_file.length,
+                        )
+                        placements.append(TrackPlacement(
+                            track_name=track_name,
+                            track_index=ti,
+                            region=placed,
+                        ))
+            found_placements = True
+            break  # use only the first 0x1054 with tracks
 
-            # region index is in parent 0x100f block — find via block_type of this block
-            region_idx = b.block_type
-            region = region_by_index.get(region_idx)
-            if region is None:
-                continue
-
-            placements.append(TrackPlacement(
-                track_name=track_name,
-                track_index=raw_track_idx,
-                region=region,
-            ))
-    else:
-        warnings.append("No track placement blocks (0x100e) found — track layout may be empty")
+    if not found_placements:
+        warnings.append("No track placement blocks (0x1054) found — track layout may be empty")
 
     session.placements = placements
     return session
 
 
 def _resolve_audio_path(session_dir: str, filename: str) -> str | None:
+    # PTF may store full relative paths; use basename for filesystem lookup
+    basename = os.path.basename(filename)
     candidates = [
-        os.path.join(session_dir, "Audio Files", filename),
-        os.path.join(session_dir, filename),
+        os.path.join(session_dir, "Audio Files", basename),
+        os.path.join(session_dir, "Fade Files", basename),
+        os.path.join(session_dir, basename),
     ]
+    # Also search any immediate subdirectory (catches renamed "Audio Files" and "Fade Files" folders)
     try:
         for entry in os.listdir(session_dir):
-            if "Audio Files" in entry:
-                candidates.append(os.path.join(session_dir, entry, filename))
+            entry_path = os.path.join(session_dir, entry)
+            if os.path.isdir(entry_path):
+                candidates.append(os.path.join(entry_path, basename))
     except OSError:
         pass
+    seen: set[str] = set()
     for c in candidates:
-        if os.path.exists(c):
-            return c
+        if c not in seen:
+            seen.add(c)
+            if os.path.exists(c):
+                return c
     return None
