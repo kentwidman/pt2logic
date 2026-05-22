@@ -13,6 +13,11 @@ import aaf2.mobs
 import aaf2.components
 import aaf2.ama
 from aaf2.rational import AAFRational
+from aaf2.auid import AUID
+
+# Standard AAF AUIDs for MonoAudioGain (AAF spec §14)
+_MONO_AUDIO_GAIN_AUID = AUID("9d2ea891-0968-11d3-8a38-0050040ef7d2")
+_LEVEL_PARAM_AUID     = AUID("e4962321-2267-11d3-8a4c-0050040ef7d2")
 
 from ptx_parser import SessionData, AudioFile, Region, TrackPlacement
 
@@ -173,6 +178,31 @@ def _resolve_comp_overlaps(placements: list, track_name: str, warnings: list) ->
     return sorted(result, key=lambda p: p.region.start_pos)
 
 
+def _register_gain_defs(f):
+    """Register MonoAudioGain operation def and LEVEL parameter def if not already present."""
+    try:
+        f.dictionary.lookup_operationdef('MonoAudioGain')
+        return  # already registered
+    except Exception:
+        pass
+    op_def = f.create.from_name('OperationDef', _MONO_AUDIO_GAIN_AUID, 'MonoAudioGain', 'Gain Adjustment - Mono')
+    op_def.media_kind = 'Sound'
+    op_def['IsTimeWarp'].value = False
+    op_def['NumberInputs'].value = 1
+    f.dictionary.register_def(op_def)
+    param_def = f.create.from_name('ParameterDef', _LEVEL_PARAM_AUID, 'LEVEL', 'Level/Gain', 'Rational')
+    f.dictionary.register_def(param_def)
+
+
+def _wrap_gain(f, seq, gain_num: int, gain_den: int = 1):
+    """Wrap a Sequence in a MonoAudioGain OperationGroup."""
+    og = f.create.OperationGroup('MonoAudioGain', length=seq.length)
+    param = f.create.ConstantValue('LEVEL', AAFRational(gain_num, gain_den))
+    og['Parameters'].append(param)
+    og.segments.append(seq)
+    return og
+
+
 def _network_locator(f, path: str):
     n = f.create.NetworkLocator()
     n['URLString'].value = pathlib.Path(path).as_uri()
@@ -186,6 +216,7 @@ def write(session: SessionData, output_path: str, warnings: list | None = None) 
     edit_rate = AAFRational(session.sample_rate, 1)
 
     with aaf2.open(output_path, 'w') as f:
+        _register_gain_defs(f)
         master_mobs: dict[int, aaf2.mobs.MasterMob] = {}
 
         for af in session.audio_files:
@@ -257,8 +288,10 @@ def write(session: SessionData, output_path: str, warnings: list | None = None) 
 
                 cursor = r.start_pos + clip_length
 
-            # Set sequence and slot length to total duration
+            # Set sequence length; for muted tracks wrap in zero-gain OperationGroup
             seq.length = cursor
+            if track_name in session.muted_tracks and cursor > 0:
+                slot.segment = _wrap_gain(f, seq, 0, 1)
 
 
 def _create_mob_chain(f, af: AudioFile, edit_rate, sample_rate: int, warnings: list):

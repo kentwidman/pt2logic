@@ -52,6 +52,7 @@ class SessionData:
     audio_files: list = field(default_factory=list)
     regions: list = field(default_factory=list)
     placements: list = field(default_factory=list)
+    muted_tracks: set = field(default_factory=set)
 
 
 @dataclass
@@ -439,8 +440,8 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
                         last_child_end = ce
                 tail = data[last_child_end:block_end]
                 if tail and tail[0] == 0x00:
-                    warnings.append(f"Track '{track_name}': muted, skipping")
-                    continue
+                    session.muted_tracks.add(track_name)
+                    warnings.append(f"Track '{track_name}': muted (importing at zero volume)")
 
                 for b50 in b52.children:
                     if b50.content_type != 0x1050:
