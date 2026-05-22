@@ -5,7 +5,7 @@ Usage: python convert.py <session.ptf> <output.aaf> [--verbose]
 Converts a Pro Tools session file (.ptf for PT7-8, .ptx for PT10+) to an AAF
 file that can be imported into Logic Pro X via File → Import → AAF.
 
-Preserves: track names, clip timeline positions, audio file references.
+Preserves: track names, clip timeline positions, audio file references, mute state.
 Does not transfer: effects, automation, pan, volume.
 """
 

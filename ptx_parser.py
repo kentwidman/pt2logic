@@ -254,6 +254,7 @@ def _parse_three_point(data, pos, big_endian, ratefactor):
     )
 
 
+
 def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
     if warnings is None:
         warnings = []
@@ -403,24 +404,16 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
     # --- Track placements ---
     placements = []
 
-    # Build ordered track name list from 0x1014 blocks (sorted by file offset = session order)
-    track_names_ordered = []
-    if 0x1014 in idx:
-        for b in sorted(idx[0x1014], key=lambda b: b.offset):
-            p = b.offset + 2
-            if p + 4 > len(data):
-                continue
-            name, name_len = _parse_string(data, p, big_endian)
-            if name_len > 0:
-                track_names_ordered.append(name)
-
     # Build region index
     region_by_index = {r.index: r for r in regions}
 
     # Walk 0x1054 → 0x1052 (tracks) → 0x1050 → 0x104f (placements)
-    # PT7/8 uses this hierarchy; each 0x1052 is one track in order.
-    # Per ptformat: region index is a plain 4-byte LE value at b4f.offset+4;
-    # timeline position is at b4f.offset+9 (4 bytes + 1 unknown byte after index).
+    # Each 0x1052 block stores the track name at its content start:
+    #   b52.offset+2: 4-byte name length (LE), then the name string
+    # The single byte after all child blocks encodes active state:
+    #   0x01 = active/unmuted, 0x00 = muted — muted tracks are skipped.
+    # Per ptformat: region index is a 4-byte LE value at b4f.offset+4;
+    # timeline position is at b4f.offset+9.
     # 0x1050 blocks with byte +46 == 0x01 are fade markers — skip them here since
     # pre-rendered fades are handled separately via 0x100a blocks.
     found_placements = False
@@ -430,7 +423,25 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
             if not children_52:
                 continue
             for ti, b52 in enumerate(children_52):
-                track_name = track_names_ordered[ti] if ti < len(track_names_ordered) else f"Track {ti}"
+                # Read track name directly from block content (4-byte len prefix at offset+2)
+                name_len = _read4(data, b52.offset + 2, big_endian)
+                if name_len > 0 and b52.offset + 6 + name_len <= len(data):
+                    track_name = data[b52.offset + 6:b52.offset + 6 + name_len].decode('latin-1', errors='replace')
+                else:
+                    track_name = f"Track {ti}"
+
+                # Read mute state from the single byte after the last child block
+                block_end = b52.offset + b52.block_size
+                last_child_end = b52.offset + 2
+                for child in b52.children:
+                    ce = child.offset + child.block_size
+                    if ce > last_child_end:
+                        last_child_end = ce
+                tail = data[last_child_end:block_end]
+                if tail and tail[0] == 0x00:
+                    warnings.append(f"Track '{track_name}': muted, skipping")
+                    continue
+
                 for b50 in b52.children:
                     if b50.content_type != 0x1050:
                         continue
