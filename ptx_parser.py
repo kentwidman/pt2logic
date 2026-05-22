@@ -282,9 +282,9 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
     # We'll pass 1.0 initially and fix up after parsing sample rate
     ratefactor = 1.0
 
-    # Parse block tree
+    # Parse block tree (ptformat convention: start at 0x1f)
     blocks = []
-    pos = 0x14
+    pos = 0x1f
     while pos < len(data):
         next_z = data.find(0x5A, pos)
         if next_z == -1:
@@ -419,8 +419,10 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
 
     # Walk 0x1054 → 0x1052 (tracks) → 0x1050 → 0x104f (placements)
     # PT7/8 uses this hierarchy; each 0x1052 is one track in order.
-    # Region index is stored at b4f.offset+2 as a 4-byte LE value where
-    # the actual index occupies the high 2 bytes: region_idx = value >> 16.
+    # Per ptformat: region index is a plain 4-byte LE value at b4f.offset+4;
+    # timeline position is at b4f.offset+9 (4 bytes + 1 unknown byte after index).
+    # 0x1050 blocks with byte +46 == 0x01 are fade markers — skip them here since
+    # pre-rendered fades are handled separately via 0x100a blocks.
     found_placements = False
     if 0x1054 in idx:
         for b54 in sorted(idx[0x1054], key=lambda b: b.offset):
@@ -432,20 +434,23 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
                 for b50 in b52.children:
                     if b50.content_type != 0x1050:
                         continue
+                    # Skip 0x1050 blocks flagged as fade markers (ptformat offset +46 == 0x01)
+                    if b50.offset + 48 <= len(data) and data[b50.offset + 46] == 0x01:
+                        continue
                     for b4f in b50.children:
                         if b4f.content_type != 0x104f:
                             continue
-                        if b4f.offset + 6 > len(data):
+                        if b4f.offset + 13 > len(data):
                             continue
-                        region_idx = _read4(data, b4f.offset + 2, big_endian) >> 16
+                        region_idx = _read4(data, b4f.offset + 4, big_endian)
                         region = region_by_index.get(region_idx)
                         if region is None:
                             warnings.append(
                                 f"Track '{track_name}': no region at index {region_idx}, skipping"
                             )
                             continue
-                        # Timeline position lives at b4f.offset+9 (verified for PT7/8).
-                        tl_start = _read4(data, b4f.offset + 9, big_endian) if b4f.offset + 13 <= len(data) else 0
+                        # Timeline position at b4f.offset+9 (verified against ptformat).
+                        tl_start = _read4(data, b4f.offset + 9, big_endian)
                         # Skip "displaced" clips: clips whose region was originally defined at a
                         # different timeline position than where they are placed here. These are
                         # alternate takes or cross-track edits that were superseded in the final
@@ -475,6 +480,119 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
 
     if not found_placements:
         warnings.append("No track placement blocks (0x1054) found — track layout may be empty")
+
+    # --- Fade placements (0x100a blocks) ---
+    # Each 0x100a contains one 0x1008 child (the fade region, with name_len=0) and
+    # up to two 0x1050→0x104f children referencing the adjacent regular clips.
+    # The adjacent clip refs tell us which track the fade belongs to and where the
+    # junction is. Fade position = later_clip_start − fade_length (fade-out style,
+    # ending exactly at the junction so the incoming clip plays from its start).
+    region_to_track: dict[int, tuple[str, int]] = {
+        p.region.index: (p.track_name, p.track_index) for p in placements
+    }
+
+    if 0x100a in idx:
+        fade_region_index = len(regions)  # start fresh indices after normal regions
+        for b100a in sorted(idx[0x100a], key=lambda b: b.offset):
+            b1008 = next((c for c in b100a.children if c.content_type == 0x1008), None)
+            if not b1008:
+                continue
+
+            fp = b1008.offset + 11
+            if fp + 4 > len(data):
+                continue
+            name_len = _read4(data, fp, big_endian)
+            if name_len > 200:
+                continue
+            fp += 4 + name_len  # skip name_len field (name is always empty for fades)
+
+            sample_offset, fade_length, start_pos = _parse_three_point(data, fp, big_endian, 1.0)
+            findex_pos = b1008.offset + b1008.block_size - 13
+            findex = _read4(data, findex_pos, big_endian) if findex_pos + 4 <= len(data) else -1
+
+            if not (0 <= findex < len(audio_files)):
+                continue
+            af = audio_files[findex]
+            if not af.is_fade:
+                continue
+
+            fade_length = fade_length if fade_length > 0 else af.length
+            if fade_length <= 0:
+                continue
+
+            # Collect adjacent clip refs, sorted by timeline position
+            refs: list[tuple[int, int]] = []
+            for b1050 in b100a.children:
+                if b1050.content_type != 0x1050:
+                    continue
+                for b4f in b1050.children:
+                    if b4f.content_type != 0x104f:
+                        continue
+                    region_ref = _read4(data, b4f.offset + 4, big_endian)
+                    tl = _read4(data, b4f.offset + 9, big_endian) if b4f.offset + 13 <= len(data) else 0
+                    refs.append((region_ref, tl))
+
+            if not refs:
+                continue
+            refs.sort(key=lambda x: x[1])
+
+            # Track: use the track of the first recognisable adjacent clip
+            track_name, track_index = None, None
+            for region_ref, _ in refs:
+                if region_ref in region_to_track:
+                    track_name, track_index = region_to_track[region_ref]
+                    break
+            if track_name is None:
+                # Fallback: match region name prefix to a track name
+                # e.g. 'Guitar 1 ribbon_02-02' → track 'Guitar 1 ribbon'
+                track_by_name = {tn: ti for tn, ti in region_to_track.values()}
+                for region_ref, _ in refs:
+                    ref_region = region_by_index.get(region_ref)
+                    if ref_region is None:
+                        continue
+                    rname_lower = ref_region.name.lower()
+                    for tn, ti in track_by_name.items():
+                        if rname_lower.startswith(tn.lower()):
+                            track_name, track_index = tn, ti
+                            break
+                    if track_name is not None:
+                        break
+
+            if track_name is None:
+                warnings.append(f"Fade '{af.filename}': cannot determine track, skipping")
+                continue
+
+            # Timeline position of the fade
+            if len(refs) >= 2:
+                # Crossfade: fade ends at the junction (= later clip's start)
+                fade_tl_start = refs[-1][1] - fade_length
+            else:
+                # Single clip: fade-out at end of clip, or fade-in at start
+                ref_region = region_by_index.get(refs[0][0])
+                if ref_region is not None and refs[0][1] + ref_region.length > refs[0][1]:
+                    # Fade-out: place at end of the referenced clip
+                    fade_tl_start = refs[0][1] + ref_region.length - fade_length
+                else:
+                    # Fallback: fade-in at clip start
+                    fade_tl_start = refs[0][1]
+
+            if fade_tl_start < 0:
+                fade_tl_start = 0
+
+            fade_region = Region(
+                index=fade_region_index,
+                name=af.filename,
+                audio_file=af,
+                start_pos=fade_tl_start,
+                sample_offset=0,
+                length=fade_length,
+            )
+            fade_region_index += 1
+            placements.append(TrackPlacement(
+                track_name=track_name,
+                track_index=track_index,
+                region=fade_region,
+            ))
 
     session.placements = placements
     return session
