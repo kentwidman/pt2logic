@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Does
 
-Converts Pro Tools session files (`.ptf` for PT7–8 era, `.ptx` for PT10+) to AAF files importable into Logic Pro X via **File → Import → AAF**. Preserves track layout, clip timeline positions, pre-rendered fades, and mute state. Does not transfer effects, automation, pan, or volume.
+Converts Pro Tools session files (`.ptf` for PT7–8 era, `.ptx` for PT10+) to AAF files importable into Logic Pro X via **File → Import → AAF**. Preserves track layout, clip timeline positions, pre-rendered fades, mute state, and stereo L/R pair panning. Does not transfer effects, automation, mono pan, or volume.
 
 ## Setup & Usage
 
@@ -58,20 +58,18 @@ Per-track processing order in `write()`:
 1. `_resolve_comp_overlaps()` — handles PT comp sessions where long continuous takes overlap shorter comped clips. Sorts clips by length ascending (shorter = higher priority), then for each clip fills only unclaimed time intervals, splitting long takes into segments around higher-priority clips.
 2. `_trim_for_fades()` — trims main clips where pre-rendered fade files overlap.
 3. Build `Sequence` of `SourceClip` + `Filler` objects.
-4. If track is in `session.muted_tracks`, replace slot segment with `_wrap_gain(f, seq, 0, 1)`.
+4. If track is in `session.stereo_sides`, wrap with `_wrap_pan(f, seq, ±1, 1)` (inner).
+5. If track is in `session.muted_tracks`, wrap with `_wrap_gain(f, seg, 0, 1)` (outer).
 
-#### MonoAudioGain pyaaf2 API note
-`pyaaf2` ships with no built-in operation/parameter defs. Register them once per file via `_register_gain_defs(f)` before use:
-```python
-op_def  = f.create.from_name('OperationDef',  AUID("9d2ea891-..."), 'MonoAudioGain', '...', )
-param_def = f.create.from_name('ParameterDef', AUID("e4962321-..."), 'LEVEL', '...', 'Rational')
-f.dictionary.register_def(op_def); f.dictionary.register_def(param_def)
-# Then:
-og = f.create.OperationGroup('MonoAudioGain', length=N)
-og['Parameters'].append(f.create.ConstantValue('LEVEL', AAFRational(0, 1)))
-og.segments.append(seq)
-slot.segment = og
+#### MonoAudioGain / MonoAudioPan pyaaf2 API note
+`pyaaf2` ships with no built-in operation/parameter defs. Register them once per file via `_register_audio_defs(f)` before use:
 ```
+MonoAudioGain  OperationDef  AUID 9d2ea891-0968-11d3-8a38-0050040ef7d2
+LEVEL          ParameterDef  AUID e4962321-2267-11d3-8a4c-0050040ef7d2  type=Rational
+MonoAudioPan   OperationDef  AUID db5c9f25-1db9-11d4-8001-080036210804
+PAN            ParameterDef  AUID e4962322-2267-11d3-8a4c-0050040ef7d2  type=Rational
+```
+Pan values: `-1/1` = full left, `1/1` = full right.  Operation groups nest: outer group wraps inner (pan inner, gain outer for muted stereo tracks).
 
 ### Data model (shared)
 ```
@@ -80,8 +78,11 @@ SessionData
   regions:       [Region(index, name, audio_file, start_pos, sample_offset, length)]
   placements:    [TrackPlacement(track_name, track_index, region)]
   muted_tracks:  set[str]   — track names where PT mute flag was 0x00
+  stereo_sides:  dict[str, str]  — track_name → 'L' or 'R' (detected from .L/.R filename suffix)
 ```
 `Region.start_pos` is the absolute timeline position in samples. `sample_offset` is the in-point within the source file.
+
+Stereo pair detection: after placements are built, `ptx_parser` scans audio filenames. A track whose clips use only `*.L.wav`/`*_L.wav` files is flagged `'L'`; `*.R.wav`/`*_R.wav` → `'R'`. `aaf_writer` wraps those tracks in a `MonoAudioPan` OperationGroup (`-1/1` for L, `+1/1` for R).
 
 ## Supported Versions
 
@@ -96,19 +97,24 @@ SessionData
 
 ## Test Session
 
-Working test file (PT7, 96000 Hz, 8 tracks, 71 audio files):
+Primary test file (PT7, 44100 Hz, 46 tracks, 692 audio files):
+```
+circa/circa mix4.ptf
+```
+
+Current output: 349 warnings — 345 displaced-clip skips (cross-track alternate takes + inactive-playlist clips) + 2 audio files not found on disk (`snare 1.wav`, `snare 2.wav`, using synthetic WAVE headers) + 2 corresponding "not found" log lines. Zero overlap errors. No muted tracks in this session (all `0x01` tail bytes). No stereo L/R pairs detected.
+
+Legacy test file (PT7, 96000 Hz, 8 tracks, 71 audio files) — still present but no longer primary:
 ```
 8 - 27 - 08/Macintosh HD/Users/erikwidman/Desktop/blacklodge session/8 - 27 - 08/8 - 27 - 08.ptf
 ```
 Note: The top-level `8 - 27 - 08/8 - 27 - 08.ptf` is 0 bytes (data is in a macOS HFS+ resource fork). Use the nested path above.
 
-Current output: 35 warnings — 34 expected "displaced clip" skips (cross-track alternate takes) + 1 long take fully covered by comped clips. Zero overlap errors. No muted tracks in this test session (all `0x01` tail bytes).
-
 ## Remaining Work
 
 - [ ] **End-to-end Logic Pro import test** — import `output.aaf` into Logic Pro X and verify tracks play back correctly (timeline positions, audio file references, fades, muted tracks at zero volume).
 - [ ] **Mute flag validation on a session with muted tracks** — the `active_byte` theory (`0x00` = muted) is inferred from the test session where all tracks are `0x01`. Needs a session with known-muted tracks to confirm. If wrong, muted-track logic would need revisiting.
-- [ ] **Volume and pan** — static track volume/pan not found in `0x1052` blocks. May be in automation block types not yet decoded, or may require a session with non-unity fader positions to locate. The `MonoAudioGain` infrastructure in `aaf_writer.py` is ready once the PT values are found.
+- [ ] **Mono track pan and volume** — automation block structure is partially decoded. `0x101c → 0x1023 → 0x1029` hierarchy: each track has 11 automation lanes; **lane[0] = volume** (confirmed by varied negative values in `v0` of 0x1029 across mix tracks), **lane[1] = pan** (one data point: v0=-120 for a panned track, but scale is unclear — not simply ±100). All 0x1025 value blocks are zeros in both test sessions so the static value lives in the 0x1029 payload at offset+3 as a signed BE int32. Needs a session with a known pan position to confirm the scale and write production code. `MonoAudioPan` infrastructure is already registered in `aaf_writer.py`.
 - [ ] **PT10+ (.ptx) support validation** — the `.ptx` path (`0x2629` regions, `xor_type=0x05`) is implemented but untested. Find a PT10–12 session and run through it.
 - [ ] **AIFF file handling** — `AIFCDescriptor` path uses `aaf2.ama.get_aifc_fmt()`; needs a session with `.aif` source files to confirm the summary bytes are accepted by Logic.
 - [ ] **Displaced-clip heuristic review** — displaced clips are silently skipped. Some may be legitimate alternate takes. Consider a `--keep-alternates` flag.

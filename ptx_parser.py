@@ -53,6 +53,7 @@ class SessionData:
     regions: list = field(default_factory=list)
     placements: list = field(default_factory=list)
     muted_tracks: set = field(default_factory=set)
+    stereo_sides: dict = field(default_factory=dict)   # track_name → 'L' or 'R'
 
 
 @dataclass
@@ -327,9 +328,8 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
                 p += 4
                 filename = data[p:p + name_len].decode('latin-1', errors='replace')
                 p += name_len
-                wavtype = data[p:p + 4] if p + 4 <= len(data) else b''
-                p += 4
-                p += 5  # skip metadata bytes
+                p += 4   # wavtype (unused)
+                p += 5   # skip metadata bytes
                 if filename.lower().endswith(AUDIO_EXTENSIONS):
                     af = AudioFile(
                         index=len(audio_files),
@@ -351,7 +351,7 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
         af.is_fade = 'fade files' in path_hint.lower()
         if af.resolved_path is None:
             warnings.append(f"Audio file not found on disk: {af.filename}")
-        elif af.length == 0:
+        else:
             af.length = _get_wav_nsamples(af.resolved_path)
 
     session.audio_files = audio_files
@@ -378,8 +378,11 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
             # Region time values are in raw samples; ratefactor does not apply here.
             sample_offset, length, start_pos = _parse_three_point(data, p, big_endian, 1.0)
 
-            # audio file index: 4 bytes at block_size-13 from b.offset
-            findex_pos = b.offset + b.block_size - 13
+            # audio file index: last 4 bytes of block (big-endian sessions) or
+            # 4 bytes at block_size-13 (little-endian sessions, which have a
+            # 9-byte footer of two IEEE 754 1.0 floats after the findex).
+            tail = 4 if big_endian else 13
+            findex_pos = b.offset + b.block_size - tail
             if findex_pos + 4 <= len(data):
                 findex = _read4(data, findex_pos, big_endian)
             else:
@@ -452,7 +455,7 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
                     for b4f in b50.children:
                         if b4f.content_type != 0x104f:
                             continue
-                        if b4f.offset + 13 > len(data):
+                        if b4f.offset + 18 > len(data):
                             continue
                         region_idx = _read4(data, b4f.offset + 4, big_endian)
                         region = region_by_index.get(region_idx)
@@ -461,19 +464,20 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
                                 f"Track '{track_name}': no region at index {region_idx}, skipping"
                             )
                             continue
-                        # Timeline position at b4f.offset+9 (verified against ptformat).
-                        tl_start = _read4(data, b4f.offset + 9, big_endian)
-                        # Skip "displaced" clips: clips whose region was originally defined at a
-                        # different timeline position than where they are placed here. These are
-                        # alternate takes or cross-track edits that were superseded in the final
-                        # session state. Clips at their native position (start_pos == tl_start)
-                        # represent the active comp.
-                        if region.start_pos != tl_start:
+                        # Byte at offset+17: 0x03 = active comp clip, 0x01 = alternate take.
+                        # Also check the single trailing byte of the parent 0x1050 block:
+                        # 0x01 means the clip is on an inactive/alternate playlist even when
+                        # byte+17 reads 0x03 (e.g. scratch-ref clips left on the wrong track).
+                        b4f_end = b4f.offset + b4f.block_size
+                        b50_trailing = data[b4f_end] if b4f_end < b50.offset + b50.block_size else 0x00
+                        if data[b4f.offset + 17] == 0x01 or b50_trailing == 0x01:
                             warnings.append(
-                                f"Track '{track_name}': skipping displaced clip '{region.name}' "
-                                f"(native pos={region.start_pos}, placed at={tl_start})"
+                                f"Track '{track_name}': skipping alternate take '{region.name}'"
                             )
                             continue
+                        # Timeline position: offset+9 for little-endian, offset+13 for big-endian.
+                        tl_offset = 13 if big_endian else 9
+                        tl_start = _read4(data, b4f.offset + tl_offset, big_endian)
                         placed = Region(
                             index=region.index,
                             name=region.name,
@@ -607,29 +611,110 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
             ))
 
     session.placements = placements
+
+    # --- Stereo side detection (.L/.R filename convention) ---
+    # Pro Tools stores stereo tracks as separate mono files named base.L.wav / base.R.wav
+    # (or base_L.wav / base_R.wav).  A track whose clips use *only* .L files is the left
+    # channel; *only* .R files means the right channel.  Mixed tracks are left as mono.
+    track_afs: dict[str, set] = {}
+    for tp in placements:
+        track_afs.setdefault(tp.track_name, set()).add(tp.region.audio_file.filename)
+
+    for track_name, fnames in track_afs.items():
+        sides: set[str] = set()
+        for fn in fnames:
+            stem = os.path.splitext(fn)[0]
+            if stem.endswith('.L') or stem.endswith('_L'):
+                sides.add('L')
+            elif stem.endswith('.R') or stem.endswith('_R'):
+                sides.add('R')
+        if sides == {'L'}:
+            session.stereo_sides[track_name] = 'L'
+        elif sides == {'R'}:
+            session.stereo_sides[track_name] = 'R'
+
     return session
 
 
-def _resolve_audio_path(session_dir: str, filename: str) -> str | None:
-    # PTF may store full relative paths; use basename for filesystem lookup
-    basename = os.path.basename(filename)
-    candidates = [
-        os.path.join(session_dir, "Audio Files", basename),
-        os.path.join(session_dir, "Fade Files", basename),
-        os.path.join(session_dir, basename),
+def dump_blocks(ptf_path: str):
+    """Print block type inventory and hex dumps for reverse-engineering unknown types."""
+    with open(ptf_path, 'rb') as f:
+        raw = f.read()
+
+    data = _decrypt(raw)
+    big_endian = (data[0x11] == 0x01) if len(data) > 0x11 else False
+
+    blocks = []
+    pos = 0x1f
+    while pos < len(data):
+        next_z = data.find(0x5A, pos)
+        if next_z == -1:
+            break
+        block, pos = _parse_block_at(data, next_z, len(data), big_endian)
+        if block is not None:
+            blocks.append(block)
+        else:
+            pos = next_z + 1
+
+    idx = _index_blocks(blocks)
+
+    print("=== Block Type Inventory ===")
+    for ct in sorted(idx.keys()):
+        blist = idx[ct]
+        sizes = sorted(set(b.block_size for b in blist))
+        print(f"  0x{ct:04x}  count={len(blist):4d}  sizes={sizes[:8]}")
+
+    # Automation/mixing block types to investigate for pan/volume
+    target_types = [
+        0x101a, 0x101b, 0x101c, 0x101d,
+        0x1021, 0x1022, 0x1023, 0x1025, 0x1026, 0x1029, 0x102d,
     ]
-    # Also search any immediate subdirectory (catches renamed "Audio Files" and "Fade Files" folders)
+
+    for ct in target_types:
+        if ct not in idx:
+            continue
+        blist = idx[ct]
+        print(f"\n=== 0x{ct:04x} ({len(blist)} blocks) ===")
+        for i, b in enumerate(blist[:4]):
+            payload = data[b.offset + 2: b.offset + b.block_size]
+            print(f"  [{i}] file_offset=0x{b.offset:08x}  block_size={b.block_size}  children={len(b.children)}")
+            hex_str = ' '.join(f'{x:02x}' for x in payload[:80])
+            print(f"       hex: {hex_str}")
+            if len(payload) >= 4:
+                u32s = []
+                for j in range(0, min(len(payload) - 3, 40), 4):
+                    u32s.append(struct.unpack_from('<I', payload, j)[0])
+                print(f"       u32(LE): {u32s}")
+            # Try length-prefixed string at start
+            if len(payload) >= 4:
+                slen = struct.unpack_from('<I', payload, 0)[0]
+                if 0 < slen <= 128 and 4 + slen <= len(payload):
+                    try:
+                        s = payload[4:4 + slen].decode('latin-1')
+                        if all(c.isprintable() or c in '\t\n' for c in s):
+                            print(f"       str[0]: len={slen} '{s}'")
+                    except Exception:
+                        pass
+            if b.children:
+                child_types = [f'0x{c.content_type:04x}' for c in b.children]
+                print(f"       children: {child_types}")
+        if len(blist) > 4:
+            print(f"  ... ({len(blist) - 4} more)")
+
+
+def _resolve_audio_path(session_dir: str, filename: str) -> str | None:
+    basename = os.path.basename(filename)
+    # Fast path: standard Pro Tools folder names at the session root
+    for folder in ('Audio Files', 'Fade Files', ''):
+        candidate = os.path.join(session_dir, folder, basename) if folder else os.path.join(session_dir, basename)
+        if os.path.exists(candidate):
+            return candidate
+    # Recursive search handles sessions restored from archives or macOS HFS+ disk images
+    # where Audio Files / Fade Files may be nested arbitrarily deep.
     try:
-        for entry in os.listdir(session_dir):
-            entry_path = os.path.join(session_dir, entry)
-            if os.path.isdir(entry_path):
-                candidates.append(os.path.join(entry_path, basename))
+        for dirpath, _, filenames in os.walk(session_dir):
+            if basename in filenames:
+                return os.path.join(dirpath, basename)
     except OSError:
         pass
-    seen: set[str] = set()
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            if os.path.exists(c):
-                return c
     return None

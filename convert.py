@@ -13,7 +13,7 @@ import sys
 import os
 import argparse
 
-from ptx_parser import parse, PTXError, UnsupportedVersionError, ParseError
+from ptx_parser import parse, dump_blocks, PTXError, UnsupportedVersionError, ParseError
 import aaf_writer
 
 
@@ -22,12 +22,22 @@ def main():
         description="Convert Pro Tools session to AAF for Logic Pro import"
     )
     parser.add_argument("input", help="Pro Tools session file (.ptf for PT7-8, .ptx for PT10+)")
-    parser.add_argument("output", help="Output AAF file path")
+    parser.add_argument("output", nargs="?", help="Output AAF file path")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show all warnings")
+    parser.add_argument("--dump-blocks", action="store_true",
+                        help="Dump block type inventory and hex content (for reverse-engineering)")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
         print(f"Error: input file not found: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.dump_blocks:
+        dump_blocks(args.input)
+        sys.exit(0)
+
+    if not args.output:
+        print("Error: output file required (unless using --dump-blocks)", file=sys.stderr)
         sys.exit(1)
 
     warnings = []
@@ -56,7 +66,9 @@ def main():
     if tracks:
         print(f"  Tracks     : {len(tracks)}")
         for name, count in sorted(tracks.items(), key=lambda x: x[0]):
-            print(f"    {name} ({count} clip{'s' if count != 1 else ''})")
+            side = session.stereo_sides.get(name, '')
+            tag = f" [{side}]" if side else ""
+            print(f"    {name}{tag} ({count} clip{'s' if count != 1 else ''})")
 
     try:
         print(f"\nWriting {args.output} ...")
