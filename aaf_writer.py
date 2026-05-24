@@ -7,6 +7,7 @@ import os
 import struct
 import pathlib
 import sys
+from fractions import Fraction
 
 import aaf2
 import aaf2.mobs
@@ -15,11 +16,9 @@ import aaf2.ama
 from aaf2.rational import AAFRational
 from aaf2.auid import AUID
 
-# Standard AAF AUIDs for MonoAudioGain and MonoAudioPan (AAF spec §14)
-_MONO_AUDIO_GAIN_AUID = AUID("9d2ea891-0968-11d3-8a38-0050040ef7d2")
-_LEVEL_PARAM_AUID     = AUID("e4962321-2267-11d3-8a4c-0050040ef7d2")
-_MONO_AUDIO_PAN_AUID  = AUID("db5c9f25-1db9-11d4-8001-080036210804")
-_PAN_PARAM_AUID       = AUID("e4962322-2267-11d3-8a4c-0050040ef7d2")
+# Standard AAF AUIDs for MonoAudioGain (from AAF SDK / pyaaf2 model)
+_MONO_AUDIO_GAIN_AUID = AUID("9d2ea894-0968-11d3-8a38-0050040ef7d2")  # OperationDef_MonoAudioGain
+_LEVEL_PARAM_AUID     = AUID("e4962320-2267-11d3-8a4c-0050040ef7d2")  # ParameterDef_Level
 
 from ptx_parser import SessionData, AudioFile, Region, TrackPlacement
 
@@ -181,7 +180,7 @@ def _resolve_comp_overlaps(placements: list, track_name: str, warnings: list) ->
 
 
 def _register_audio_defs(f):
-    """Register MonoAudioGain and MonoAudioPan operation/parameter defs if not already present."""
+    """Register MonoAudioGain operation/parameter defs if not already present."""
     try:
         f.dictionary.lookup_operationdef('MonoAudioGain')
     except Exception:
@@ -193,34 +192,15 @@ def _register_audio_defs(f):
         param_def = f.create.from_name('ParameterDef', _LEVEL_PARAM_AUID, 'LEVEL', 'Level/Gain', 'Rational')
         f.dictionary.register_def(param_def)
 
-    try:
-        f.dictionary.lookup_operationdef('MonoAudioPan')
-    except Exception:
-        op_def = f.create.from_name('OperationDef', _MONO_AUDIO_PAN_AUID, 'MonoAudioPan', 'Pan Adjustment - Mono')
-        op_def.media_kind = 'Sound'
-        op_def['IsTimeWarp'].value = False
-        op_def['NumberInputs'].value = 1
-        f.dictionary.register_def(op_def)
-        param_def = f.create.from_name('ParameterDef', _PAN_PARAM_AUID, 'PAN', 'Pan Position', 'Rational')
-        f.dictionary.register_def(param_def)
-
 
 def _wrap_gain(f, seg, gain_num: int, gain_den: int = 1):
     """Wrap a segment in a MonoAudioGain OperationGroup."""
-    og = f.create.OperationGroup('MonoAudioGain', length=seg.length)
+    og = f.create.OperationGroup('MonoAudioGain', media_kind='sound', length=seg.length)
     param = f.create.ConstantValue('LEVEL', AAFRational(gain_num, gain_den))
     og['Parameters'].append(param)
     og.segments.append(seg)
     return og
 
-
-def _wrap_pan(f, seg, pan_num: int, pan_den: int = 1):
-    """Wrap a segment in a MonoAudioPan OperationGroup. -1/1 = full left, 1/1 = full right."""
-    og = f.create.OperationGroup('MonoAudioPan', length=seg.length)
-    param = f.create.ConstantValue('PAN', AAFRational(pan_num, pan_den))
-    og['Parameters'].append(param)
-    og.segments.append(seg)
-    return og
 
 
 def _network_locator(f, path: str):
@@ -311,20 +291,18 @@ def write(session: SessionData, output_path: str, warnings: list | None = None) 
 
                 cursor = r.start_pos + clip_length
 
-            # Apply pan for stereo sides; wrap muted tracks at zero gain; attach to slot.
-            # seq was built independently (not via slot.segment) so wrapping it in an
-            # OperationGroup doesn't trigger pyaaf2's "Object already attached" guard.
             seq.length = cursor
             segment = seq
 
-            side = session.stereo_sides.get(track_name)
-            if side == 'L':
-                segment = _wrap_pan(f, segment, -1, 1)
-            elif side == 'R':
-                segment = _wrap_pan(f, segment, 1, 1)
+            vol_db, _pan = session.track_automation.get(track_name, (0.0, 0.0))
 
+            # Gain: mute overrides fader volume. Logic Pro AAF import supports volume automation.
             if track_name in session.muted_tracks and cursor > 0:
                 segment = _wrap_gain(f, segment, 0, 1)
+            elif vol_db != 0.0 and cursor > 0:
+                gain = 10.0 ** (vol_db / 20.0)
+                frac = Fraction(gain).limit_denominator(100000)
+                segment = _wrap_gain(f, segment, frac.numerator, frac.denominator)
 
             slot.segment = segment
 

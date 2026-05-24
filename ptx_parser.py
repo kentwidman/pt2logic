@@ -4,6 +4,7 @@ Primary target: PT7-8 .ptf files (2008 era), xor_type=0x01, mul=53.
 Based on reverse engineering documented in https://github.com/zamaudio/ptformat
 """
 
+import re
 import struct
 import os
 from dataclasses import dataclass, field
@@ -54,6 +55,7 @@ class SessionData:
     placements: list = field(default_factory=list)
     muted_tracks: set = field(default_factory=set)
     stereo_sides: dict = field(default_factory=dict)   # track_name → 'L' or 'R'
+    track_automation: dict = field(default_factory=dict)  # track_name → (vol_db, pan) where vol_db is dB from unity, pan is -1..+1
 
 
 @dataclass
@@ -255,6 +257,69 @@ def _parse_three_point(data, pos, big_endian, ratefactor):
         int(start_val  * ratefactor),
     )
 
+
+
+def _extract_automation(data, idx, big_endian):
+    """Extract static volume/pan from 0x101c automation blocks.
+
+    Returns dict of track_name → (vol_db, pan):
+      vol_db  dB offset from unity (0.0 = no change); scale: raw / 10.0
+      pan     normalised pan -1.0 (full left) .. +1.0 (full right); scale: raw / 1000.0
+              (pan scale unconfirmed — needs a session with a known pan position to validate)
+
+    Hierarchy: 0x101c → 0x102d → 0x101b (track name)
+               0x101c → 0x1023[0] → 0x1029 offset+3 (vol raw, signed int32)
+               0x101c → 0x1023[1] → 0x1029 offset+3 (pan raw, signed int32)
+
+    Tracks named "Audio N" are skipped — their names are too ambiguous for reliable matching.
+    Both exact names and names with .dupN suffix stripped are indexed so that automation
+    blocks named e.g. "guitar choppy.dup1" also match the placement track "guitar choppy".
+    """
+    auto = {}
+
+    def _s32(offset):
+        if offset + 4 > len(data):
+            return 0
+        fmt = '>i' if big_endian else '<i'
+        return struct.unpack_from(fmt, data, offset)[0]
+
+    for b1c in sorted(idx.get(0x101c, []), key=lambda b: b.offset):
+        b102d = next((c for c in b1c.children if c.content_type == 0x102d), None)
+        if not b102d:
+            continue
+        b101b = next((c for c in b102d.children if c.content_type == 0x101b), None)
+        if not b101b or b101b.offset + 6 > len(data):
+            continue
+        nlen = _read4(data, b101b.offset + 2, big_endian)
+        if not (0 < nlen <= 128 and b101b.offset + 6 + nlen <= len(data)):
+            continue
+        name = data[b101b.offset + 6: b101b.offset + 6 + nlen].decode('latin-1', errors='replace')
+
+        if re.fullmatch(r'Audio \d+', name):
+            continue  # generic name — can't correlate reliably
+
+        lanes = [c for c in b1c.children if c.content_type == 0x1023]
+        vol_raw = 0
+        pan_raw = 0
+        for li, b23 in enumerate(lanes[:2]):
+            b29 = next((c for c in b23.children if c.content_type == 0x1029), None)
+            if b29 and b29.offset + 7 <= len(data):
+                val = _s32(b29.offset + 3)
+                if li == 0:
+                    vol_raw = val
+                else:
+                    pan_raw = val
+
+        vol_db = vol_raw / 10.0
+        pan    = pan_raw / 1000.0
+
+        if name not in auto:
+            auto[name] = (vol_db, pan)
+        base = re.sub(r'\.dup\d+$', '', name)
+        if base != name and base not in auto:
+            auto[base] = (vol_db, pan)
+
+    return auto
 
 
 def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
@@ -611,6 +676,9 @@ def parse(ptf_path: str, warnings: list | None = None) -> SessionData:
             ))
 
     session.placements = placements
+
+    # --- Automation (volume / pan) ---
+    session.track_automation = _extract_automation(data, idx, big_endian)
 
     # --- Stereo side detection (.L/.R filename convention) ---
     # Pro Tools stores stereo tracks as separate mono files named base.L.wav / base.R.wav
